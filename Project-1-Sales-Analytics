@@ -1,1 +1,116 @@
+-- ===================================================================
+-- Project: Enterprise Sales & Operational Analytics Dashboard
+-- Author: Jai Vaghani (Business Analyst)
+-- Database: PostgreSQL / Standard ANSI SQL
+-- Description: Aggregates enterprise sales data, computes month-over-month (MoM)
+--              growth, calculates moving averages, and identifies dynamic customer churn.
+-- ===================================================================
 
+-- -------------------------------------------------------------------
+-- SECTION 1: Monthly Sales Performance with CTEs and Window Functions
+-- Purpose: Extract monthly revenue, track cumulative revenue by region,
+--          and calculate prior month revenue for MoM comparison.
+-- -------------------------------------------------------------------
+WITH MonthlySalesSummary AS (
+    SELECT 
+        DATE_TRUNC('month', order_date) AS sales_month,
+        region,
+        product_category,
+        COUNT(DISTINCT order_id) AS total_orders,
+        COUNT(DISTINCT customer_id) AS active_customers,
+        SUM(revenue) AS total_revenue,
+        AVG(revenue) AS avg_order_value
+    FROM enterprise_sales
+    WHERE status = 'Completed'
+    GROUP BY 
+        DATE_TRUNC('month', order_date),
+        region,
+        product_category
+)
+SELECT 
+    sales_month,
+    region,
+    product_category,
+    total_orders,
+    active_customers,
+    total_revenue,
+    avg_order_value,
+    
+    -- Cumulative Revenue by Region over time
+    SUM(total_revenue) OVER (
+        PARTITION BY region 
+        ORDER BY sales_month
+    ) AS cumulative_region_revenue,
+    
+    -- Lagged Revenue for MoM Growth Calculation
+    LAG(total_revenue, 1) OVER (
+        PARTITION BY region, product_category 
+        ORDER BY sales_month
+    ) AS prev_month_revenue,
+    
+    -- Month-over-Month Revenue Growth Percentage
+    ROUND(
+        ((total_revenue - LAG(total_revenue, 1) OVER (
+            PARTITION BY region, product_category 
+            ORDER BY sales_month
+        )) / NULLIF(LAG(total_revenue, 1) OVER (
+            PARTITION BY region, product_category 
+            ORDER BY sales_month
+        ), 0)) * 100, 2
+    ) AS mom_growth_pct
+
+FROM MonthlySalesSummary
+ORDER BY sales_month DESC, region, total_revenue DESC;
+
+
+-- -------------------------------------------------------------------
+-- SECTION 2: Identifying Top 10 High-Value Customers per Region
+-- Purpose: Use ROW_NUMBER() window function to isolate priority enterprise accounts.
+-- -------------------------------------------------------------------
+WITH CustomerRankings AS (
+    SELECT 
+        c.customer_id,
+        c.customer_name,
+        c.region,
+        SUM(s.revenue) AS lifetime_value,
+        COUNT(s.order_id) AS total_orders_placed,
+        ROW_NUMBER() OVER (
+            PARTITION BY c.region 
+            ORDER BY SUM(s.revenue) DESC
+        ) AS rank_in_region
+    FROM customers c
+    JOIN enterprise_sales s ON c.customer_id = s.customer_id
+    WHERE s.status = 'Completed'
+    GROUP BY c.customer_id, c.customer_name, c.region
+)
+SELECT 
+    rank_in_region,
+    region,
+    customer_name,
+    lifetime_value,
+    total_orders_placed
+FROM CustomerRankings
+WHERE rank_in_region <= 10
+ORDER BY region, rank_in_region;
+
+
+-- -------------------------------------------------------------------
+-- SECTION 3: Customer Churn & Inactivity Detection Logic
+-- Purpose: Identify enterprise clients with no order activity in the last 90 days.
+-- -------------------------------------------------------------------
+SELECT 
+    c.customer_id,
+    c.customer_name,
+    c.region,
+    MAX(s.order_date) AS last_order_date,
+    CURRENT_DATE - MAX(s.order_date)::DATE AS days_inactive,
+    CASE 
+        WHEN CURRENT_DATE - MAX(s.order_date)::DATE > 120 THEN 'High Churn Risk'
+        WHEN CURRENT_DATE - MAX(s.order_date)::DATE BETWEEN 90 AND 120 THEN 'Medium Churn Risk'
+        ELSE 'Active'
+    END AS churn_status
+FROM customers c
+LEFT JOIN enterprise_sales s ON c.customer_id = s.customer_id
+GROUP BY c.customer_id, c.customer_name, c.region
+HAVING MAX(s.order_date) < (CURRENT_DATE - INTERVAL '90 days') OR MAX(s.order_date) IS NULL
+ORDER BY days_inactive DESC;
